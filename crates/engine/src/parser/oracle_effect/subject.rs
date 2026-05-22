@@ -333,6 +333,45 @@ fn try_parse_subject_restriction_clause(
 ) -> Option<ParsedEffectClause> {
     let lower = text.to_lowercase();
 
+    // CR 508.1d: "[subject] attack(s) [player?] this turn/combat if able"
+    // Handles plural-noun-phrase subjects that are not caught by `starts_with_subject_prefix`
+    // (e.g. "Creatures your opponents control attack this turn if able"). Scans for the
+    // attack-if-able duration phrase at word boundaries; everything before it is the subject.
+    // Mirrors `inject_subject_target`'s GenericEffect arm: sets both `static_def.affected`
+    // and the outer broadcast `target` to the parsed subject filter.
+    if let Some((before_lower, duration, _rest)) =
+        nom_primitives::scan_preceded(&lower, |i| parse_attack_if_able_duration(i))
+    {
+        let subject_text = text[..before_lower.trim_end().len()].trim();
+        if !subject_text.is_empty() {
+            if let Some(application) = parse_subject_application(subject_text, ctx) {
+                let subject_filter = application
+                    .target
+                    .clone()
+                    .unwrap_or_else(|| application.affected.clone());
+                let affected = static_affected_for_application(&application);
+                return Some(ParsedEffectClause {
+                    effect: Effect::GenericEffect {
+                        static_abilities: vec![StaticDefinition::new(StaticMode::MustAttack)
+                            .affected(affected)
+                            .modifications(vec![ContinuousModification::AddStaticMode {
+                                mode: StaticMode::MustAttack,
+                            }])],
+                        duration: Some(duration.clone()),
+                        target: Some(subject_filter),
+                    },
+                    distribute: None,
+                    multi_target: application.multi_target,
+                    duration: Some(duration),
+                    sub_ability: None,
+                    condition: None,
+                    optional: false,
+                    unless_pay: None,
+                });
+            }
+        }
+    }
+
     // CR 509.1c: "Target creature must be blocked [this turn] [if able]"
     // Handled separately because "must be blocked" isn't a "can't X" restriction pattern
     // and needs AddStaticMode for transient effect propagation through the layer system.
