@@ -5598,6 +5598,62 @@ mod tests {
         );
     }
 
+    /// Grisly Anglerfish: "Creatures your opponents control attack this turn if able."
+    /// The subject filter (opponent-controlled creatures) must propagate into the
+    /// GenericEffect's static `affected` and `target` fields.
+    #[test]
+    fn creatures_opponents_control_attack_this_turn_if_able() {
+        use crate::types::ability::TargetFilter;
+        use crate::types::statics::StaticMode;
+        let r = parse(
+            "Islandwalk\n{6}: Creatures your opponents control attack this turn if able.",
+            "Grisly Anglerfish",
+            &[],
+            &["Creature"],
+            &["Fish"],
+        );
+        // The activated ability ("Creatures your opponents control attack this turn if able.")
+        // is in the abilities list (ParsedAbilities.abilities contains all non-trigger, non-static
+        // resolved abilities including activated ones).
+        let ability = r
+            .abilities
+            .iter()
+            .find(|a| {
+                matches!(
+                    a.effect.as_ref(),
+                    Effect::GenericEffect { static_abilities, .. }
+                        if static_abilities.iter().any(|s| s.mode == StaticMode::MustAttack)
+                )
+            })
+            .expect("Grisly Anglerfish must have a MustAttack ability");
+        let Effect::GenericEffect {
+            static_abilities,
+            target,
+            duration: Some(crate::types::ability::Duration::UntilEndOfTurn),
+            ..
+        } = ability.effect.as_ref()
+        else {
+            panic!(
+                "expected GenericEffect(MustAttack, UntilEndOfTurn), got {:?}",
+                ability.effect
+            );
+        };
+        assert!(
+            !static_abilities.is_empty() && static_abilities[0].mode == StaticMode::MustAttack,
+            "static mode must be MustAttack"
+        );
+        // Subject filter (opponent-controlled creatures) must reach the affected field.
+        assert!(
+            static_abilities[0].affected.is_some(),
+            "static affected must be set from subject"
+        );
+        // Outer target must also carry the opponent-creature filter.
+        assert!(
+            matches!(target, Some(TargetFilter::Typed(_))),
+            "outer target must be a Typed filter (opponent creatures)"
+        );
+    }
+
     #[test]
     fn no_maximum_hand_size_routes_to_static_parser() {
         let r = parse(

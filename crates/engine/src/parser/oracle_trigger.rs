@@ -1,7 +1,7 @@
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
-use nom::character::complete::one_of;
+use nom::character::complete::{one_of, space1};
 use nom::combinator::{all_consuming, eof, opt, peek, recognize, rest, value};
 use nom::multi::{many1, separated_list1};
 use nom::sequence::{delimited, pair, preceded, terminated};
@@ -4464,6 +4464,7 @@ fn try_parse_event(
         TappedForMana,
         BecomesUntapped,
         TurnFaceUp,
+        BecomesMonstrous,
         Mutates,
         ExploitsCreature,
         Exploits,
@@ -4521,6 +4522,11 @@ fn try_parse_event(
             value(SimpleEvent::BecomesUntapped, tag("becomes untapped")),
             value(SimpleEvent::BecomesUntapped, tag("untaps")),
             value(SimpleEvent::TurnFaceUp, tag("is turned face up")),
+            // CR 701.37b: "When ~ becomes monstrous" trigger event.
+            value(
+                SimpleEvent::BecomesMonstrous,
+                (tag("becomes"), space1, tag("monstrous")),
+            ),
             value(SimpleEvent::Mutates, tag("mutates")),
             // CR 702.110b: "exploits a creature" — exploit trigger
             value(SimpleEvent::ExploitsCreature, tag("exploits a creature")),
@@ -4591,6 +4597,10 @@ fn try_parse_event(
             }
             SimpleEvent::TurnFaceUp => {
                 def.mode = TriggerMode::TurnFaceUp;
+                def.valid_card = Some(subject.clone());
+            }
+            SimpleEvent::BecomesMonstrous => {
+                def.mode = TriggerMode::BecomeMonstrous;
                 def.valid_card = Some(subject.clone());
             }
             SimpleEvent::Mutates => {
@@ -13152,6 +13162,16 @@ mod tests {
     }
 
     #[test]
+    fn trigger_becomes_monstrous_mode() {
+        let def = parse_trigger_line(
+            "When this creature becomes monstrous, creatures without flying your opponents control can't block this turn.",
+            "Stoneshock Giant",
+        );
+        assert_eq!(def.mode, TriggerMode::BecomeMonstrous);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    }
+
+    #[test]
     fn trigger_put_into_graveyard_from_anywhere() {
         let def = parse_trigger_line(
             "When this card is put into a graveyard from anywhere, draw a card.",
@@ -14829,6 +14849,61 @@ mod tests {
         assert_eq!(def.constraint, None);
     }
 
+    /// CR 107.3i + CR 120.1 + CR 510.1: Tymna the Weaver — the trigger body
+    /// must bind `X` from the trailing "where X is …" clause across BOTH the
+    /// "pay X life" cost AND the "draw X cards" sub-ability. The bound
+    /// expression must resolve to
+    /// `PlayerCount { OpponentDealtCombatDamage }`, not to an empty-shaped
+    /// `ObjectCount` (which previously matched every battlefield permanent
+    /// and made Tymna draw all 12 of the player's permanents instead of 1).
+    #[test]
+    fn trigger_tymna_the_weaver_pays_and_draws_bound_x() {
+        use crate::types::ability::{Effect, PaymentCost, PlayerFilter, QuantityExpr, QuantityRef};
+
+        let def = parse_trigger_line(
+            "At the beginning of each of your postcombat main phases, you may pay X life, \
+             where X is the number of opponents that were dealt combat damage this turn. \
+             If you do, draw X cards.",
+            "Tymna the Weaver",
+        );
+        assert_eq!(def.mode, TriggerMode::Phase);
+        assert_eq!(def.phase, Some(Phase::PostCombatMain));
+        assert!(def.optional, "trigger should be optional ('you may')");
+
+        let bound_qty = QuantityExpr::Ref {
+            qty: QuantityRef::PlayerCount {
+                filter: PlayerFilter::OpponentDealtCombatDamage,
+            },
+        };
+
+        let execute = def
+            .execute
+            .as_ref()
+            .expect("trigger must have an execute body");
+
+        // CR 118.8 + CR 107.3i: pay-life cost amount carries the bound X.
+        match execute.effect.as_ref() {
+            Effect::PayCost {
+                cost: PaymentCost::Life { amount },
+                ..
+            } => assert_eq!(*amount, bound_qty, "pay-life cost amount must be bound X"),
+            other => panic!("expected PayCost::Life, got {:?}", other),
+        }
+
+        // CR 121.1 + CR 107.3i: the conditional "if you do, draw X cards"
+        // sub-ability count carries the SAME bound X.
+        let sub = execute
+            .sub_ability
+            .as_ref()
+            .expect("trigger must have draw sub-ability");
+        match sub.effect.as_ref() {
+            Effect::Draw { count, .. } => {
+                assert_eq!(*count, bound_qty, "draw count must be bound X");
+            }
+            other => panic!("expected Effect::Draw, got {:?}", other),
+        }
+    }
+
     #[test]
     fn trigger_first_main_phase() {
         // CR 505.1: "first main phase" is an alias for precombat main phase.
@@ -14857,7 +14932,7 @@ mod tests {
     /// 3. CR 122.1: "remove all charge counters from ~" →
     ///    `Effect::RemoveCounter { counter_type: "charge", count: -1, target:
     ///    SelfRef }` (count=-1 is the "remove all" sentinel).
-    /// 4. CR 609.3 + CR 106.1 + CR 122.1: "If you do, add one mana of any
+    /// 4. CR 608.2c + CR 106.1 + CR 122.1: "If you do, add one mana of any
     ///    color for each charge counter removed this way" →
     ///    sub_ability with `condition: Some(IfYouDo)` and effect
     ///    `Effect::Mana { produced: AnyOneColor { count:
