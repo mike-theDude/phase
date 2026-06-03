@@ -3341,6 +3341,16 @@ fn apply_continuous_effect_filtered(
                 if !obj.keywords.contains(&resolved_keyword) {
                     obj.keywords.push(resolved_keyword.clone());
                 }
+                // CR 702.86b + CR 702.135b + CR 702.112c + CR 613.1f: Each
+                // instance of a parameterized multi-instance keyword
+                // (Annihilator N, Afterlife N, Renown N, etc.) is its own
+                // separately-firing triggered ability, granted in Layer 6
+                // (ability-adding effects). The dedup pattern
+                // used by `GrantTrigger` / `RetainPrintedTriggerFromSource`
+                // below is NOT applicable here — printed Annihilator 1 + a
+                // separate granted Annihilator 1 must remain as two trigger
+                // instances, not collapse into one (asserted by
+                // `add_keyword_annihilator_preserves_printed_and_granted_instances`).
                 for trigger in KeywordTriggerInstaller::triggers_for(&resolved_keyword) {
                     obj.trigger_definitions.push(trigger);
                 }
@@ -3775,23 +3785,85 @@ pub(crate) fn compute_current_copiable_values(
                 ..
             } => {
                 values = (**effect_values).clone();
-                for trigger in state
-                    .transient_continuous_effects
-                    .iter()
-                    .filter(|tce| {
-                        tce.source_id == effect.source_id
-                            && tce.timestamp == effect.timestamp
-                            && tce.affected == effect.affected_filter
+                // CR 707.9b + CR 707.9a: "Except it has [keyword]" rides on the
+                // SAME transient continuous effect as the CopyValues that
+                // implements "becomes a copy of …". Companion modifications
+                // (`GrantTrigger`, `AddKeyword`) extend the copiable view so
+                // downstream copies (Mirror Image of the copy, Helm of the
+                // Host, populate) inherit the exception. Freestanding
+                // `AddKeyword` effects from auras/statics live in Layer 6 only
+                // and must NOT be promoted into copiable values per CR 707.2 —
+                // the filter below enforces "same TCE only" by matching the
+                // CopyValues effect's stable `transient_id` against the TCE's
+                // `id`. `transient_id == None` denotes a static-derived
+                // CopyValues with no backing transient (no companion
+                // modifications can live on a non-existent TCE), so the
+                // sibling iterator is empty in that case — behavior matches
+                // the prior `(source_id, timestamp, affected)` tuple match
+                // since no TCE would share all three fields with a static.
+                let sibling_modifications = effect
+                    .transient_id
+                    .into_iter()
+                    .flat_map(|tid| {
+                        state
+                            .transient_continuous_effects
+                            .iter()
+                            .filter(move |tce| tce.id == tid)
                     })
-                    .flat_map(|tce| &tce.modifications)
-                    .filter_map(|modification| match modification {
-                        ContinuousModification::GrantTrigger { trigger } => Some(trigger),
-                        _ => None,
-                    })
-                {
-                    let triggers = Arc::make_mut(&mut values.trigger_definitions);
-                    if !triggers.iter().any(|t| t == trigger.as_ref()) {
-                        triggers.push(*trigger.clone());
+                    .flat_map(|tce| &tce.modifications);
+                for modification in sibling_modifications {
+                    match modification {
+                        ContinuousModification::GrantTrigger { trigger } => {
+                            let triggers = Arc::make_mut(&mut values.trigger_definitions);
+                            if !triggers.iter().any(|t| t == trigger.as_ref()) {
+                                triggers.push(*trigger.clone());
+                            }
+                        }
+                        // CR 707.9b: A granted keyword from "except it has X"
+                        // joins the copy's copiable keywords AND its synthesized
+                        // companion triggers (Myriad's attack trigger, Mentor's
+                        // attack trigger, Annihilator's attack trigger, etc.).
+                        // The trigger synthesis mirrors the Layer 6 AddKeyword
+                        // arm (`KeywordTriggerInstaller::triggers_for`) so the
+                        // copiable view matches the live `obj.trigger_definitions`
+                        // installed by Layer 6.
+                        //
+                        // Keyword presence is idempotent — dedup on
+                        // `values.keywords` (one Myriad is one Myriad). The
+                        // trigger list, however, intentionally does NOT dedup
+                        // here. This mirrors the Layer 6 AddKeyword arm
+                        // (`obj.trigger_definitions.push(trigger)` without a
+                        // structural-equality guard) which exists precisely
+                        // for CR 702.86b + CR 702.135b + CR 702.112c: each
+                        // instance of a parameterized multi-instance keyword
+                        // (Annihilator N, Afterlife N, Renown N, etc.) is its
+                        // own separately-firing triggered ability. A chained
+                        // copy (populate / Helm of the Host) of "X becomes a
+                        // copy of Y except it has Annihilator 1" where Y
+                        // already prints Annihilator 1 must yield TWO
+                        // attack-trigger instances in the copiable view, not
+                        // one — `token_copy.rs` consumes
+                        // `compute_current_copiable_values().trigger_definitions`
+                        // directly as the token's live trigger list without a
+                        // Layer 6 re-grant, so dedup here would silently halve
+                        // the per-instance firing count. For single-instance
+                        // keywords like Myriad the source and the granted
+                        // exception both having that keyword is not a real
+                        // scenario for "except it has Myriad" (the source
+                        // wouldn't need the exception), and even if it occurs
+                        // the redundant duplicate trigger fires twice — which
+                        // is the correct per-instance semantics under the same
+                        // CR 702.86b rule that governs the multi-instance case.
+                        ContinuousModification::AddKeyword { keyword } => {
+                            if !values.keywords.contains(keyword) {
+                                values.keywords.push(keyword.clone());
+                            }
+                            let triggers = Arc::make_mut(&mut values.trigger_definitions);
+                            for trigger in KeywordTriggerInstaller::triggers_for(keyword) {
+                                triggers.push(trigger);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

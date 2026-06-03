@@ -494,6 +494,74 @@ mod tests {
         assert!(source.card_types.subtypes.contains(&"Bear".to_string()));
         assert!(source.card_types.subtypes.contains(&"Bird".to_string()));
         assert!(source.keywords.contains(&Keyword::Flying));
+
+        // CR 707.9b: "Except it has [keyword]" modifies the copy's copiable
+        // values — downstream copies (Mirror Image of Mockingbird, Helm of
+        // the Host, populate) must inherit the granted keyword. The keyword
+        // and its synthesized companion triggers must appear in
+        // `compute_current_copiable_values` as the building-block layer that
+        // downstream copy effects read from. This is the class-level guard
+        // for the granted-keyword copyable-value propagation, not just a
+        // single-card check.
+        let copiable = compute_current_copiable_values(&state, source_id)
+            .expect("Mockingbird still has copiable values after BecomeCopy");
+        assert!(
+            copiable.keywords.contains(&Keyword::Flying),
+            "copiable keywords must reflect the granted Flying"
+        );
+        // Use a keyword whose companion trigger is synthesized via the
+        // `KeywordTriggerInstaller` (Flying has none; Myriad does) — verify
+        // that pattern too on a second copy attempt to exercise the trigger
+        // path independently.
+        let source_id_b = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Second Mocker".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source_id_b).unwrap();
+            s.base_name = "Second Mocker".to_string();
+            s.base_power = Some(1);
+            s.base_toughness = Some(1);
+            s.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![],
+            };
+        }
+        let ability_myriad = ResolvedAbility::new(
+            Effect::BecomeCopy {
+                target: TargetFilter::Any,
+                duration: None,
+                mana_value_limit: None,
+                additional_modifications: vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Myriad,
+                }],
+            },
+            vec![TargetRef::Object(target_id)],
+            source_id_b,
+            PlayerId(0),
+        );
+        let mut events_b = Vec::new();
+        resolve(&mut state, &ability_myriad, &mut events_b).unwrap();
+        let copiable_b = compute_current_copiable_values(&state, source_id_b)
+            .expect("second copier still has copiable values");
+        assert!(
+            copiable_b.keywords.contains(&Keyword::Myriad),
+            "copiable keywords must reflect the granted Myriad"
+        );
+        // The Myriad companion attack trigger must appear in the copiable
+        // trigger set so a downstream copy of this object inherits it.
+        let myriad_trigger_in_copiable = copiable_b
+            .trigger_definitions
+            .iter()
+            .any(|t| matches!(t.mode, crate::types::triggers::TriggerMode::Attacks));
+        assert!(
+            myriad_trigger_in_copiable,
+            "synthesized Myriad attack trigger must appear in copiable trigger_definitions"
+        );
     }
 
     // ── Plan test 3/8: Chained copies ─────────────────────────────────────
@@ -1340,5 +1408,416 @@ mod tests {
             has_myriad_trigger,
             "Myriad attack trigger should be synthesized when keyword is granted"
         );
+    }
+
+    // CR 702.86b + CR 707.9b: Each instance of a parameterized multi-instance
+    // keyword (Annihilator N, Afterlife N, Renown N) is its own
+    // separately-firing triggered ability. When `compute_current_copiable_values`
+    // synthesizes the granted-keyword companion trigger inside the CopyValues
+    // arm, the trigger list must NOT dedup against the copied source's already-
+    // present matching trigger. token_copy.rs consumes the copiable
+    // `trigger_definitions` directly without a Layer 6 re-grant, so dedup here
+    // would silently halve the per-instance firing count on chained copies
+    // (populate / Helm of the Host of "X becomes a copy of Y except it has
+    // Annihilator 1" where Y already has printed Annihilator 1).
+    #[test]
+    fn compute_current_copiable_values_preserves_multi_instance_keyword_trigger_count() {
+        use crate::types::ability::ContinuousModification;
+        use crate::types::keywords::Keyword;
+        use crate::types::triggers::TriggerMode;
+
+        let mut state = GameState::new_two_player(42);
+
+        // Target: a creature that already prints Annihilator 1, so its
+        // intrinsic copiable values already include the synthesized
+        // Annihilator attack trigger.
+        let target = create_creature(&mut state, 1, PlayerId(0), "Eldrazi", 5, 5);
+        let printed_annihilator_trigger =
+            crate::database::synthesis::KeywordTriggerInstaller::triggers_for(
+                &Keyword::Annihilator(1),
+            )
+            .pop()
+            .expect("Annihilator has a companion trigger template");
+        {
+            let obj = state.objects.get_mut(&target).unwrap();
+            obj.base_keywords = vec![Keyword::Annihilator(1)];
+            obj.base_trigger_definitions = Arc::new(vec![printed_annihilator_trigger.clone()]);
+        }
+
+        // Source: an empty shapeshifter that becomes a copy of the Eldrazi
+        // "except it has Annihilator 1" — the granted keyword via AddKeyword
+        // collides byte-for-byte with the printed Annihilator 1 trigger.
+        let source = create_creature(&mut state, 2, PlayerId(0), "Shapeshifter", 1, 1);
+
+        let ability = ResolvedAbility::new(
+            Effect::BecomeCopy {
+                target: TargetFilter::Any,
+                duration: None,
+                mana_value_limit: None,
+                additional_modifications: vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Annihilator(1),
+                }],
+            },
+            vec![TargetRef::Object(target)],
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let copiable = compute_current_copiable_values(&state, source)
+            .expect("source still has copiable values after BecomeCopy");
+
+        // Keyword dedup is correct — one Annihilator 1 in the copiable
+        // keywords (presence is idempotent).
+        let annihilator_keyword_count = copiable
+            .keywords
+            .iter()
+            .filter(|kw| matches!(kw, Keyword::Annihilator(1)))
+            .count();
+        assert_eq!(
+            annihilator_keyword_count, 1,
+            "copiable keywords must dedup: Annihilator 1 appears once"
+        );
+
+        // Trigger-list dedup is WRONG for multi-instance keywords — the
+        // copiable trigger list must hold TWO Annihilator attack triggers
+        // so downstream token copies (token_copy.rs) fire per-instance per
+        // CR 702.86b.
+        let attack_trigger_count = copiable
+            .trigger_definitions
+            .iter()
+            .filter(|t| matches!(t.mode, TriggerMode::Attacks))
+            .count();
+        assert_eq!(
+            attack_trigger_count, 2,
+            "copiable trigger_definitions must preserve printed + granted \
+             Annihilator instances as separate trigger entries (CR 702.86b)"
+        );
+    }
+
+    // ── Issue #1558: End-to-end runtime reproducer ───────────────────────────
+    // CR 707.9b + CR 702.116: Muddle, the Ever-Changing becomes a copy of
+    // Face-Breaker "except it has myriad", then attacking softlocks the game.
+    // Drives the full runtime: resolve BecomeCopy → layers → declare attacker →
+    // trigger fires → resolve trigger (optional may prompt) → accept → exactly
+    // one tapped attacking token attacking the other opponent → EOC exile
+    // delayed trigger scheduled. No panic, no softlock.
+    #[test]
+    fn become_copy_with_granted_myriad_runtime_three_player_attack_no_softlock() {
+        use crate::game::combat::AttackTarget;
+        use crate::types::ability::ContinuousModification;
+        use crate::types::actions::GameAction;
+        use crate::types::card_type::Supertype;
+        use crate::types::format::FormatConfig;
+        use crate::types::game_state::{StackEntryKind, WaitingFor};
+        use crate::types::keywords::Keyword;
+        use crate::types::phase::Phase;
+
+        // 3-player game so Myriad has two opponents (PlayerId(1), PlayerId(2)),
+        // making the "for each other opponent" loop create exactly one token.
+        // (The 2-player case is a zero-token no-op and masks the softlock.)
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        state.turn_number = 2;
+        state.phase = Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::DeclareAttackers {
+            player: PlayerId(0),
+            valid_attacker_ids: vec![],
+            valid_attack_targets: vec![],
+        };
+
+        // Target: Face-Breaker-shaped vanilla creature (4/3, no Myriad).
+        let target = create_creature(&mut state, 1, PlayerId(0), "Face-Breaker", 4, 3);
+
+        // Source: Muddle-shaped legendary creature (no Myriad on its base face).
+        let source = create_creature(&mut state, 2, PlayerId(0), "Muddle", 2, 2);
+        {
+            let muddle = state.objects.get_mut(&source).unwrap();
+            muddle.base_card_types = CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![],
+            };
+            // CR 302.6: not summoning-sick, eligible to attack this turn.
+            muddle.entered_battlefield_turn = Some(1);
+        }
+
+        // Resolve BecomeCopy with the "except it has myriad" modification.
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::BecomeCopy {
+                target: TargetFilter::Any,
+                duration: None,
+                mana_value_limit: None,
+                additional_modifications: vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Myriad,
+                }],
+            },
+            vec![TargetRef::Object(target)],
+            source,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // Layer pipeline ran inside resolve(): Muddle should now be a
+        // Face-Breaker copy with Myriad granted and its attack trigger
+        // synthesized (regression guard for the existing #1558 test).
+        let muddle = state.objects.get(&source).unwrap();
+        assert!(
+            muddle.keywords.contains(&Keyword::Myriad),
+            "Myriad keyword present after BecomeCopy + AddKeyword"
+        );
+
+        // Declare Muddle attacking PlayerId(1). Drain any order-triggers prompt
+        // for legacy stack-assertion semantics (CR 603.3b).
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DeclareAttackers {
+                attacks: vec![(source, AttackTarget::Player(PlayerId(1)))],
+            },
+        )
+        .expect("declare attacker");
+        crate::game::triggers::drain_order_triggers_with_identity(&mut state);
+
+        // CR 702.116b: the granted Myriad attack trigger must fire and land on
+        // the stack. If layer-6 didn't install the synthesized trigger (or
+        // installed it but `collect_matching_triggers` couldn't route it), the
+        // stack would be empty and combat would end without ever creating the
+        // token — that's the softlock.
+        let trigger_count = state
+            .stack
+            .iter()
+            .filter(|entry| matches!(entry.kind, StackEntryKind::TriggeredAbility { .. }))
+            .count();
+        assert_eq!(
+            trigger_count, 1,
+            "exactly one granted-Myriad attack trigger on the stack"
+        );
+
+        // Resolve the trigger → Myriad is a "may" effect (CR 702.116a), so the
+        // engine must transition into an OptionalEffectChoice prompt rather
+        // than panicking on an unhandled trigger identity.
+        let mut resolve_events = Vec::new();
+        crate::game::stack::resolve_top(&mut state, &mut resolve_events);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "Myriad trigger resolution opens optional-effect prompt, got {:?}",
+            state.waiting_for
+        );
+
+        // Accept the Myriad effect.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DecideOptionalEffect { accept: true },
+        )
+        .expect("accept Myriad");
+
+        // Post-acceptance: state machine returns to Priority (no panic, no
+        // wedged WaitingFor), exactly one Face-Breaker token exists tapped and
+        // attacking PlayerId(2), and the EOC exile delayed trigger is queued.
+        let token_ids: Vec<_> = state
+            .objects
+            .iter()
+            .filter_map(|(id, obj)| {
+                (obj.is_token && obj.name == "Face-Breaker" && obj.zone == Zone::Battlefield)
+                    .then_some(*id)
+            })
+            .collect();
+        assert_eq!(
+            token_ids.len(),
+            1,
+            "Myriad in 3-player creates one token attacking the other opponent"
+        );
+        let token_id = token_ids[0];
+        assert!(state.objects.get(&token_id).unwrap().tapped);
+
+        let combat = state
+            .combat
+            .as_ref()
+            .expect("combat still active during DeclareAttackers");
+        let token_attacker = combat
+            .attackers
+            .iter()
+            .find(|a| a.object_id == token_id)
+            .expect("Myriad token is attacking");
+        assert_eq!(token_attacker.defending_player, PlayerId(2));
+        assert_eq!(
+            token_attacker.attack_target,
+            AttackTarget::Player(PlayerId(2))
+        );
+        assert!(
+            combat.attackers.iter().any(|a| a.object_id == source),
+            "original Muddle attacker remains in combat"
+        );
+
+        assert_eq!(
+            state.delayed_triggers.len(),
+            1,
+            "EOC exile trigger scheduled for the Myriad token"
+        );
+        let delayed_targets = &state.delayed_triggers[0].ability.targets;
+        assert_eq!(
+            delayed_targets,
+            &vec![crate::types::ability::TargetRef::Object(token_id)]
+        );
+    }
+
+    // ── Issue #1558 (Step 1b): BecomeCopy via the stack-resolution path ──────
+    // CR 603.3 / CR 608.2: Same softlock scenario, but the BecomeCopy reaches
+    // resolution through `stack::resolve_top` on a TriggeredAbility entry
+    // (Muddle's printed "when you cast an instant, become a copy …" trigger)
+    // rather than through a direct `become_copy::resolve` call. Verifies the
+    // SpellCast → trigger-on-stack → execute_effect → BecomeCopy path applies
+    // the granted Myriad keyword and synthesizes its trigger identically to the
+    // direct-resolver path, so a real natural cast of Muddle's trigger does not
+    // softlock the subsequent declare-attackers step.
+    #[test]
+    fn become_copy_with_granted_myriad_via_stack_resolution_three_player_attack_no_softlock() {
+        use crate::game::combat::AttackTarget;
+        use crate::types::ability::ContinuousModification;
+        use crate::types::actions::GameAction;
+        use crate::types::card_type::Supertype;
+        use crate::types::format::FormatConfig;
+        use crate::types::game_state::{StackEntry, StackEntryKind, WaitingFor};
+        use crate::types::keywords::Keyword;
+        use crate::types::phase::Phase;
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        state.turn_number = 2;
+        state.phase = Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::DeclareAttackers {
+            player: PlayerId(0),
+            valid_attacker_ids: vec![],
+            valid_attack_targets: vec![],
+        };
+
+        let target = create_creature(&mut state, 1, PlayerId(0), "Face-Breaker", 4, 3);
+
+        let source = create_creature(&mut state, 2, PlayerId(0), "Muddle", 2, 2);
+        {
+            let muddle = state.objects.get_mut(&source).unwrap();
+            muddle.base_card_types = CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![],
+            };
+            muddle.entered_battlefield_turn = Some(1);
+        }
+
+        // Build the BecomeCopy ResolvedAbility that Muddle's printed SpellCast
+        // trigger would produce when targeting Face-Breaker. Targets are already
+        // chosen — this models the post-target-selection state of the trigger
+        // ready to be resolved off the stack.
+        let trigger_ability = ResolvedAbility::new(
+            Effect::BecomeCopy {
+                target: TargetFilter::Any,
+                duration: None,
+                mana_value_limit: None,
+                additional_modifications: vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Myriad,
+                }],
+            },
+            vec![TargetRef::Object(target)],
+            source,
+            PlayerId(0),
+        );
+
+        // Push as a TriggeredAbility stack entry so resolution happens via the
+        // shared `stack::resolve_top → execute_effect` path, not a direct
+        // resolver call. This is the natural-flow analog of Step 1.
+        let entry_id = crate::types::identifiers::ObjectId(state.next_object_id);
+        state.next_object_id += 1;
+        state.stack.push_back(StackEntry {
+            id: entry_id,
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: source,
+                ability: Box::new(trigger_ability),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: "Muddle".to_string(),
+                subject_match_count: None,
+                die_result: None,
+            },
+        });
+
+        // Resolve Muddle's trigger off the stack → BecomeCopy applies →
+        // layers must run and synthesize the granted-Myriad attack trigger.
+        let mut events = Vec::new();
+        crate::game::stack::resolve_top(&mut state, &mut events);
+
+        let muddle = state.objects.get(&source).unwrap();
+        assert!(
+            muddle.keywords.contains(&Keyword::Myriad),
+            "Myriad keyword present after stack-resolved BecomeCopy + AddKeyword"
+        );
+
+        // From here the flow is identical to Step 1: declare attacker → trigger
+        // on stack → resolve → optional accept → one tapped attacking token →
+        // EOC exile delayed trigger scheduled.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DeclareAttackers {
+                attacks: vec![(source, AttackTarget::Player(PlayerId(1)))],
+            },
+        )
+        .expect("declare attacker");
+        crate::game::triggers::drain_order_triggers_with_identity(&mut state);
+
+        let trigger_count = state
+            .stack
+            .iter()
+            .filter(|entry| matches!(entry.kind, StackEntryKind::TriggeredAbility { .. }))
+            .count();
+        assert_eq!(
+            trigger_count, 1,
+            "granted-Myriad attack trigger on the stack (stack-resolved BecomeCopy path)"
+        );
+
+        let mut resolve_events = Vec::new();
+        crate::game::stack::resolve_top(&mut state, &mut resolve_events);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "Myriad opens optional-effect prompt, got {:?}",
+            state.waiting_for
+        );
+
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DecideOptionalEffect { accept: true },
+        )
+        .expect("accept Myriad");
+
+        let token_ids: Vec<_> = state
+            .objects
+            .iter()
+            .filter_map(|(id, obj)| {
+                (obj.is_token && obj.name == "Face-Breaker" && obj.zone == Zone::Battlefield)
+                    .then_some(*id)
+            })
+            .collect();
+        assert_eq!(token_ids.len(), 1);
+        let token_id = token_ids[0];
+        assert!(state.objects.get(&token_id).unwrap().tapped);
+
+        let combat = state.combat.as_ref().expect("combat still active");
+        let token_attacker = combat
+            .attackers
+            .iter()
+            .find(|a| a.object_id == token_id)
+            .expect("Myriad token is attacking");
+        assert_eq!(token_attacker.defending_player, PlayerId(2));
+        assert_eq!(
+            token_attacker.attack_target,
+            AttackTarget::Player(PlayerId(2))
+        );
+
+        assert_eq!(state.delayed_triggers.len(), 1);
     }
 }

@@ -516,11 +516,45 @@ fn collect_matching_triggers(
                         modal: modal.clone(),
                         mode_abilities: mode_abilities.clone(),
                         description: trig_def.description.clone(),
+                        // CR 603.5 + CR 613.1f: A "may"-trigger's optional
+                        // choice resolves with the ability on the stack, so the
+                        // auto-choice persisted across resolution must be keyed
+                        // by a stable ability identity rather than a positional
+                        // slot that Layer 6 ability-adding effects can shift.
+                        // For an off-zone synthesized granted-keyword trigger,
+                        // identity is the keyword (`granted_keyword_kind`). For
+                        // a battlefield trigger installed by a runtime keyword
+                        // grant (Layer 6 via `KeywordTriggerInstaller`), the
+                        // discriminator is the matcher
+                        // `trigger_matches_keyword_kind` against the object's
+                        // current keywords — NOT the trig_idx position. The
+                        // index is fragile: when a CopyValues effect rebases
+                        // the object onto a source with fewer printed triggers
+                        // than the original, a granted-keyword trigger can
+                        // land below `base_trigger_definitions.len()` and a
+                        // pure index gate would misclassify it as Printed.
+                        // The matcher alone is the precise discriminator — a
+                        // printed trigger that is byte-identical to a
+                        // synthesized keyword companion trigger AND whose
+                        // object actually carries that keyword is exactly the
+                        // case we want classified as Keyword-origin; printed
+                        // triggers with no matching keyword (e.g., a copied
+                        // Face-Breaker's Treasure ETB on Muddle) fall through
+                        // to the stable `Printed` branch.
                         may_trigger_origin: Some(match granted_keyword_kind {
                             Some(kind) => MayTriggerOrigin::Keyword { keyword: kind },
-                            None => MayTriggerOrigin::Printed {
-                                trigger_index: trig_idx,
-                            },
+                            None => {
+                                let granted_kind = source_obj.keywords.iter().find_map(|kw| {
+                                    crate::database::synthesis::KeywordTriggerInstaller::trigger_matches_keyword_kind(trig_def, kw)
+                                        .then(|| kw.kind())
+                                });
+                                match granted_kind {
+                                    Some(kind) => MayTriggerOrigin::Keyword { keyword: kind },
+                                    None => MayTriggerOrigin::Printed {
+                                        trigger_index: trig_idx,
+                                    },
+                                }
+                            }
                         }),
                         subject_match_count,
                         die_result: None,
